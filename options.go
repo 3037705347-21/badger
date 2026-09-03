@@ -45,6 +45,15 @@ type Options struct {
 	Compression       options.CompressionType
 	InMemory          bool
 	MetricsEnabled    bool
+
+	// CompactionFilter, if non-nil, is consulted during compaction for every
+	// ordinary record that no active transaction can still read. Records for
+	// which the filter returns true are discarded: they are not carried into
+	// the compacted tables, so they can no longer be read, and the space they
+	// occupy is reclaimed (LSM space once the old tables are deleted, value
+	// log space via the usual value log GC). When nil (the default), nothing
+	// is filtered and compaction behaves exactly as before.
+	CompactionFilter CompactionFilter
 	// Sets the Stream.numGo field
 	NumGoroutines int
 
@@ -116,6 +125,58 @@ type Options struct {
 	maxBatchSize  int64 // max batch size in bytes
 
 	maxValueThreshold float64
+}
+
+// CompactionFilter is consulted by compactions to decide, record by record,
+// whether a record should be kept or discarded. It is a hook for custom
+// cleanup rules -- for example dropping records that match a condition, or
+// keeping only a bounded number of versions per key -- without running a
+// separate deletion process outside the DB.
+//
+// Filter is invoked while a compaction scans records. Versions of the same key
+// are offered contiguously, newest version first. It is only called for
+// records that are safe to discard:
+//   - versions at or below the compaction's discard timestamp, i.e. records
+//     no active transaction (and no in-flight value log GC rewrite) can still
+//     read. Newer records are simply offered to a later compaction, once it
+//     is safe to drop them;
+//   - ordinary values. Merge-operator operands, deletion markers and
+//     expired records are not offered: Badger manages their lifecycle itself.
+//
+// Returning true discards the record: it is omitted from the compacted tables
+// and can no longer be read, and its value-log bytes (if any) are reported to
+// value log GC for reclamation. Returning false keeps it, subject to Badger's
+// usual version cleanup (NumVersionsToKeep): a filter can only discard
+// records, it cannot keep records that Badger would otherwise remove. To keep
+// the N most recent versions per key, set NumVersionsToKeep accordingly.
+//
+// Notes for implementers:
+//   - Compactions run in parallel, so Filter must be safe for concurrent use.
+//   - The key and vs slices are only valid for the duration of the call; do
+//     not retain them.
+//   - When a record's value is stored in the value log (values larger than
+//     ValueThreshold), vs.Value holds the internal value pointer rather than
+//     the value itself. Base such rules on the key, version, UserMeta or
+//     expiry instead, or keep values in the LSM (see LSMOnlyOptions).
+//   - Discarding the newest version of a key makes the next surviving (older)
+//     version visible, just as if the newest version had never existed.
+type CompactionFilter interface {
+	// Filter returns true if the record described by key, version and vs
+	// should be discarded. key is the user key (without the internal version
+	// suffix), version is the record version (commit timestamp) and vs carries
+	// the record's Meta, UserMeta, ExpiresAt and inline Value. Internal
+	// transaction marker bits are already cleared in vs.Meta.
+	Filter(key []byte, version uint64, vs y.ValueStruct) bool
+}
+
+// CompactionFilterFunc adapts a plain function to the CompactionFilter
+// interface. Like CompactionFilter, the function must be safe for concurrent
+// use and must not retain the slices passed to it.
+type CompactionFilterFunc func(key []byte, version uint64, vs y.ValueStruct) bool
+
+// Filter implements CompactionFilter by calling f.
+func (f CompactionFilterFunc) Filter(key []byte, version uint64, vs y.ValueStruct) bool {
+	return f(key, version, vs)
 }
 
 // DefaultOptions sets a list of recommended options for good performance.
@@ -388,6 +449,31 @@ func (opt Options) WithSyncWrites(val bool) Options {
 // The default value of NumVersionsToKeep is 1.
 func (opt Options) WithNumVersionsToKeep(val int) Options {
 	opt.NumVersionsToKeep = val
+	return opt
+}
+
+// WithCompactionFilter returns a new Options value with CompactionFilter set
+// to the given filter.
+//
+// CompactionFilter is consulted during compaction for every ordinary record
+// that no active transaction can still read. Records for which the filter
+// returns true are discarded: they are not carried into the compacted tables,
+// so they can no longer be read, and the space they occupy is reclaimed (LSM
+// space once the old tables are deleted, value log space via the usual value
+// log GC). This is the hook for custom cleanup rules, e.g. dropping records
+// that match some condition instead of running a separate deletion process.
+//
+// The filter is never called for records newer than the compaction's discard
+// timestamp (they may still be visible to a running transaction), nor for
+// merge operands, deletion markers or expired records. A filter can only
+// discard records; records it keeps may still be removed by Badger's usual
+// version cleanup governed by NumVersionsToKeep.
+//
+// Compactions run concurrently, so the filter must be safe for concurrent
+// use. The default value of CompactionFilter is nil, which leaves compaction
+// unchanged.
+func (opt Options) WithCompactionFilter(f CompactionFilter) Options {
+	opt.CompactionFilter = f
 	return opt
 }
 

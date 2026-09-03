@@ -816,6 +816,30 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
 
+			// Give the user-configured compaction filter a chance to discard this
+			// record by its own rules. It only runs on records that are safe to
+			// drop: versions at or below discardTs, i.e. not visible to any active
+			// transaction (or an in-flight vlog rewrite), and ordinary values --
+			// merge operands and deletion markers are managed by Badger below, and
+			// expired records are already handled by TTL. A discarded record is
+			// treated like any other skipped record: it is not added to the new
+			// table and its value-log bytes (if any) are reported via updateStats
+			// so value log GC can reclaim them.
+			if !isExpired && version <= discardTs && vs.Meta&bitMergeEntry == 0 {
+				if cf := s.kv.opt.CompactionFilter; cf != nil {
+					// Hide the internal transaction marker bits (they are
+					// stripped on export and are not part of the record's
+					// user-visible metadata); everything else stays as-is.
+					exposed := vs
+					exposed.Meta &^= (bitTxn | bitFinTxn)
+					if cf.Filter(y.ParseKey(it.Key()), version, exposed) {
+						numSkips++
+						updateStats(vs)
+						continue
+					}
+				}
+			}
+
 			// Do not discard entries inserted by merge operator. These entries will be
 			// discarded once they're merged
 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {

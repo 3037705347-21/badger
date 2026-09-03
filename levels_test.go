@@ -687,6 +687,256 @@ func TestDiscardTs(t *testing.T) {
 	})
 }
 
+// TestCompactionFilter verifies the Options.CompactionFilter hook: records the
+// filter discards are not carried into the compacted tables (so they can no
+// longer be read), records it keeps survive alongside Badger's usual version
+// cleanup, and the safety rules hold -- records above the discard timestamp are
+// never offered and deletion markers cannot be filtered away.
+func TestCompactionFilter(t *testing.T) {
+	// Filter discards any record whose inline value is the string "drop".
+	dropValFilter := CompactionFilterFunc(func(key []byte, version uint64, vs y.ValueStruct) bool {
+		return string(vs.Value) == "drop"
+	})
+
+	t.Run("drop records by condition", func(t *testing.T) {
+		// Keep many versions so NumVersionsToKeep does not remove anything;
+		// the filter is the only thing discarding records in this test.
+		opt := DefaultOptions("").
+			WithNumCompactors(0).
+			WithNumVersionsToKeep(10).
+			WithCompactionFilter(dropValFilter)
+		opt.managedTxns = true
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			// Level 0 has tables l0 and l01; level 1 has l1.
+			l0 := []keyValVersion{{"foo", "keep", 3, 0}, {"bar", "drop", 2, 0}}
+			l01 := []keyValVersion{{"foo", "drop", 2, 0}}
+			l1 := []keyValVersion{{"foo", "keep", 1, 0}, {"baz", "drop", 1, 0}}
+			createAndOpen(db, l0, 0)
+			createAndOpen(db, l01, 0)
+			createAndOpen(db, l1, 1)
+
+			// All records are at or below the discard timestamp.
+			db.SetDiscardTs(10)
+
+			cdef := compactDef{
+				thisLevel: db.lc.levels[0],
+				nextLevel: db.lc.levels[1],
+				top:       db.lc.levels[0].tables,
+				bot:       db.lc.levels[1].tables,
+				t:         db.lc.levelTargets(),
+			}
+			cdef.t.baseLevel = 1
+			require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))
+
+			// bar and baz only had discarded records and are gone entirely.
+			// foo@2 was discarded; foo@3 and foo@1 survive.
+			getAllAndCheck(t, db, []keyValVersion{
+				{"foo", "keep", 3, 0},
+				{"foo", "keep", 1, 0},
+			})
+		})
+	})
+
+	t.Run("dropped newest version makes next version visible", func(t *testing.T) {
+		// Default NumVersionsToKeep=1 normally keeps only the newest version.
+		// When the filter discards that newest version, the next surviving
+		// version takes its place and the rest is handled as usual.
+		opt := DefaultOptions("").
+			WithNumCompactors(0).
+			WithNumVersionsToKeep(1).
+			WithCompactionFilter(dropValFilter)
+		opt.managedTxns = true
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			l0 := []keyValVersion{{"foo", "drop", 3, 0}}
+			l1 := []keyValVersion{{"foo", "keep", 2, 0}, {"foo", "old", 1, 0}}
+			createAndOpen(db, l0, 0)
+			createAndOpen(db, l1, 1)
+			db.SetDiscardTs(10)
+
+			cdef := compactDef{
+				thisLevel: db.lc.levels[0],
+				nextLevel: db.lc.levels[1],
+				top:       db.lc.levels[0].tables,
+				bot:       db.lc.levels[1].tables,
+				t:         db.lc.levelTargets(),
+			}
+			cdef.t.baseLevel = 1
+			require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))
+
+			// foo@3 discarded by the filter; foo@2 is the newest surviving
+			// version and is kept, while foo@1 is removed by NumVersionsToKeep.
+			getAllAndCheck(t, db, []keyValVersion{{"foo", "keep", 2, 0}})
+		})
+	})
+
+	t.Run("records above discardTs are not filtered", func(t *testing.T) {
+		// Snapshot safety: records a running transaction might still read must
+		// not be offered to the filter, even when they match the condition.
+		opt := DefaultOptions("").
+			WithNumCompactors(0).
+			WithNumVersionsToKeep(10).
+			WithCompactionFilter(dropValFilter)
+		opt.managedTxns = true
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			l0 := []keyValVersion{
+				{"foo", "drop", 4, 0},
+				{"bar", "drop", 3, 0},
+				{"keep", "keep", 1, 0},
+			}
+			l1 := []keyValVersion{{"other", "x", 1, 0}}
+			createAndOpen(db, l0, 0)
+			createAndOpen(db, l1, 1)
+			// discardTs=3: foo@4 stays above it and is never offered;
+			// bar@3 is at or below it and gets filtered.
+			db.SetDiscardTs(3)
+
+			cdef := compactDef{
+				thisLevel: db.lc.levels[0],
+				nextLevel: db.lc.levels[1],
+				top:       db.lc.levels[0].tables,
+				bot:       db.lc.levels[1].tables,
+				t:         db.lc.levelTargets(),
+			}
+			cdef.t.baseLevel = 1
+			require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))
+
+			getAllAndCheck(t, db, []keyValVersion{
+				{"foo", "drop", 4, 0},
+				{"keep", "keep", 1, 0},
+				{"other", "x", 1, 0},
+			})
+		})
+	})
+
+	t.Run("deletion markers are not offered", func(t *testing.T) {
+		// A filter that would drop everything must not be able to remove a
+		// deletion marker: the tombstone still has to shadow older versions
+		// that live in levels below this compaction.
+		opt := DefaultOptions("").
+			WithNumCompactors(0).
+			WithNumVersionsToKeep(10).
+			WithCompactionFilter(CompactionFilterFunc(func([]byte, uint64, y.ValueStruct) bool {
+				return true
+			}))
+		opt.managedTxns = true
+		runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
+			// foo@3 is a tombstone at level 0; foo@1 is live data that has
+			// already been compacted down to level 2 (not part of the
+			// compaction below).
+			l0 := []keyValVersion{{"foo", "bar", 3, bitDelete}}
+			l2 := []keyValVersion{{"foo", "old", 1, 0}}
+			createAndOpen(db, l0, 0)
+			createAndOpen(db, l2, 2)
+			db.SetDiscardTs(10)
+
+			cdef := compactDef{
+				thisLevel: db.lc.levels[0],
+				nextLevel: db.lc.levels[1],
+				top:       db.lc.levels[0].tables,
+				bot:       db.lc.levels[1].tables,
+				t:         db.lc.levelTargets(),
+			}
+			cdef.t.baseLevel = 1
+			require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))
+
+			// The tombstone must have survived and still shadow the live
+			// data, even though the filter discards every offered record.
+			require.NoError(t, db.View(func(txn *Txn) error {
+				_, err := txn.Get([]byte("foo"))
+				require.Equal(t, ErrKeyNotFound, err)
+				return nil
+			}))
+		})
+	})
+
+	t.Run("end to end after reopen", func(t *testing.T) {
+		dir, err := os.MkdirTemp("", "badger-test")
+		require.NoError(t, err)
+		defer removeDir(dir)
+
+		openOpts := func() Options {
+			// Disable background compactors so nothing is compacted before the
+			// discard timestamp is raised; the test compacts explicitly.
+			o := DefaultOptions(dir).
+				WithNumCompactors(0).
+				WithNumVersionsToKeep(10).
+				WithCompactionFilter(dropValFilter)
+			o.managedTxns = true
+			return o
+		}
+
+		// Write a few versions/keys and close again so the memtables flush
+		// into on-disk tables.
+		db, err := Open(openOpts())
+		require.NoError(t, err)
+		for _, e := range []keyValVersion{
+			{"a", "keep", 1, 0},
+			{"b", "drop", 1, 0},
+			{"a", "drop", 2, 0},
+			{"c", "keep", 1, 0},
+		} {
+			txn := db.NewTransactionAt(uint64(e.version), true)
+			require.NoError(t, txn.Set([]byte(e.key), []byte(e.val)))
+			require.NoError(t, txn.CommitAt(uint64(e.version), nil))
+		}
+		require.NoError(t, db.Close())
+
+		// Reopen from disk, make every record eligible for discard and run a
+		// compaction (the same call Flatten uses internally) so the filter
+		// gets applied to the flushed tables.
+		db, err = Open(openOpts())
+		require.NoError(t, err)
+		defer func() { require.NoError(t, db.Close()) }()
+
+		db.SetDiscardTs(math.MaxUint32)
+		cdef := compactDef{
+			thisLevel: db.lc.levels[0],
+			nextLevel: db.lc.levels[1],
+			top:       db.lc.levels[0].tables,
+			bot:       db.lc.levels[1].tables,
+			t:         db.lc.levelTargets(),
+		}
+		cdef.t.baseLevel = 1
+		require.NoError(t, db.lc.runCompactDef(-1, 0, cdef))
+
+		// b only ever had a discarded record: gone. a@2 was discarded, so the
+		// latest readable version of a is a@1.
+		type kv struct {
+			key string
+			ver uint64
+			val string
+		}
+		var remaining []kv
+		require.NoError(t, db.View(func(txn *Txn) error {
+			opt := DefaultIteratorOptions
+			opt.AllVersions = true
+			it := txn.NewIterator(opt)
+			defer it.Close()
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				v, err := item.ValueCopy(nil)
+				require.NoError(t, err)
+				remaining = append(remaining,
+					kv{string(item.Key()), item.Version(), string(v)})
+			}
+
+			// The discarded records cannot be read anymore.
+			_, err := txn.Get([]byte("b"))
+			require.Equal(t, ErrKeyNotFound, err)
+			item, err := txn.Get([]byte("a"))
+			require.NoError(t, err)
+			val, err := item.ValueCopy(nil)
+			require.NoError(t, err)
+			require.Equal(t, "keep", string(val))
+			return nil
+		}))
+		require.Equal(t, []kv{
+			{"a", 1, "keep"},
+			{"c", 1, "keep"},
+		}, remaining)
+	})
+}
+
 // This is a test to ensure that the first entry with DiscardEarlierversion bit < DiscardTs
 // is kept around (when numversionstokeep is infinite).
 func TestDiscardFirstVersion(t *testing.T) {
