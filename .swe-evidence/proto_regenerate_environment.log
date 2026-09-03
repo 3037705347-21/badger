@@ -1,0 +1,14 @@
+=== RUN   TestProtosRegenerate
+    protos_test.go:26: 
+        	Error Trace:	/Users/zhangchengcheng/work/ai-project/Trea/swe/badger-range-delete-T01/pb/protos_test.go:26
+        	Error:      	Received unexpected error:
+        	            	exit status 1
+        	Test:       	TestProtosRegenerate
+        	Messages:   	Got error while regenerating protos: exit status 1
+--- FAIL: TestProtosRegenerate (1.71s)
+FAIL
+FAIL	github.com/dgraph-io/badger/v4/pb	2.378s
+FAIL
+
+EXIT_CODE=1
+libprotoc 34.1

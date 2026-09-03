@@ -1,0 +1,486 @@
+diff --git a/batch.go b/batch.go
+index de3131f..fd41246 100644
+--- a/batch.go
++++ b/batch.go
+@@ -170,6 +170,28 @@ func (wb *WriteBatch) DeleteAt(k []byte, ts uint64) error {
+ 	return wb.SetEntry(&e)
+ }
+ 
++// DeleteRange is equivalent of Txn.DeleteRange. See Txn.DeleteRange for the
++// semantics of startKey/endKey.
++func (wb *WriteBatch) DeleteRange(startKey, endKey []byte) error {
++	wb.Lock()
++	defer wb.Unlock()
++
++	if err := wb.txn.DeleteRange(startKey, endKey); err != ErrTxnTooBig {
++		return err
++	}
++	// Txn has reached it's zenith. Commit now.
++	if cerr := wb.commit(); cerr != nil {
++		return cerr
++	}
++	// This time the error must not be ErrTxnTooBig, otherwise, we make the
++	// error permanent.
++	if err := wb.txn.DeleteRange(startKey, endKey); err != nil {
++		wb.err.Store(err)
++		return err
++	}
++	return nil
++}
++
+ // Delete is equivalent of Txn.Delete.
+ func (wb *WriteBatch) Delete(k []byte) error {
+ 	wb.Lock()
+diff --git a/db.go b/db.go
+index 9572203..f14dd63 100644
+--- a/db.go
++++ b/db.go
+@@ -129,6 +129,11 @@ type DB struct {
+ 	bannedNamespaces *lockedKeys
+ 	threshold        *vlogThreshold
+ 
++	// rangeDels is the in-memory index of range tombstones (DeleteRange). It
++	// is rebuilt from the LSM tree at Open and appended to on every range
++	// delete; see rangedel.go for details.
++	rangeDels *rangeDelIndex
++
+ 	pub        *publisher
+ 	registry   *KeyRegistry
+ 	blockCache *ristretto.Cache[[]byte, *table.Block]
+@@ -261,6 +266,7 @@ func Open(opt Options) (*DB, error) {
+ 		allocPool:        z.NewAllocatorPool(8),
+ 		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
+ 		threshold:        initVlogThreshold(&opt),
++		rangeDels:        newRangeDelIndex(),
+ 	}
+ 
+ 	db.flushCond = sync.NewCond(&db.lock)
+@@ -394,6 +400,12 @@ func Open(opt Options) (*DB, error) {
+ 		return db, fmt.Errorf("While setting banned keys: %w", err)
+ 	}
+ 
++	// Rebuild the in-memory range tombstone index from the range delete
++	// entries persisted in memtables and tables.
++	if err := db.loadRangeTombstones(); err != nil {
++		return db, y.Wrapf(err, "while loading range tombstones")
++	}
++
+ 	db.closers.writes = z.NewCloser(1)
+ 	go db.doWrites(db.closers.writes)
+ 
+@@ -795,6 +807,14 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
+ 
+ 	var maxVs y.ValueStruct
+ 	version := y.ParseTs(key)
++	// Range tombstones live under the internal !badger! prefix and must never
++	// be themselves shadowed by a range delete (e.g. DeleteRange(nil, nil)).
++	userKey := y.ParseKey(key)
++	canRangeDelete := !bytes.HasPrefix(userKey, badgerPrefix)
++	shadowed := func(vs y.ValueStruct) bool {
++		return canRangeDelete && (vs.Meta != 0 || vs.Value != nil) &&
++			db.rangeDels.covered(userKey, vs.Version, version)
++	}
+ 
+ 	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
+ 	for i := 0; i < len(tables); i++ {
+@@ -806,13 +826,23 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
+ 		// Found the required version of the key, return immediately.
+ 		if vs.Version == version {
+ 			y.NumGetsWithResultsAdd(db.opt.MetricsEnabled, 1)
++			if shadowed(vs) {
++				return y.ValueStruct{}, nil
++			}
+ 			return vs, nil
+ 		}
+ 		if maxVs.Version < vs.Version {
+ 			maxVs = vs
+ 		}
+ 	}
+-	return db.lc.get(key, maxVs, 0)
++	vs, err := db.lc.get(key, maxVs, 0)
++	if err != nil {
++		return y.ValueStruct{}, err
++	}
++	if shadowed(vs) {
++		return y.ValueStruct{}, nil
++	}
++	return vs, nil
+ }
+ 
+ var requestPool = sync.Pool{
+@@ -831,6 +861,13 @@ func (db *DB) writeToLSM(b *request) error {
+ 
+ 	for i, entry := range b.Entries {
+ 		var err error
++		if entry.meta&bitRangeDelete > 0 {
++			// Register the range tombstone in the in-memory index before it
++			// becomes reachable, so reads and compactions can filter the keys
++			// it shadows. It is rebuilt from the LSM tree on Open, so this
++			// registration only needs to cover new writes.
++			db.registerRangeDelete(entry)
++		}
+ 		if entry.skipVlogAndSetThreshold(db.valueThreshold()) {
+ 			// Will include deletion / tombstone case.
+ 			err = db.mt.Put(entry.Key,
+@@ -1843,6 +1880,9 @@ func (db *DB) dropAll() (func(), error) {
+ 	db.blockCache.Clear()
+ 	db.indexCache.Clear()
+ 	db.threshold.Clear(db.opt)
++	// All range tombstones were stored in the tables and value logs that were
++	// just discarded, so the in-memory index must be reset as well.
++	db.rangeDels.clear()
+ 	return resume, nil
+ }
+ 
+@@ -1906,6 +1946,11 @@ func (db *DB) DropPrefix(prefixes ...[]byte) error {
+ 	if err := db.lc.dropPrefixes(filtered); err != nil {
+ 		return err
+ 	}
++	// dropPrefixes physically removed any range tombstone markers whose
++	// internal key carried one of the dropped prefixes; drop them from the
++	// in-memory index as well, so the index matches the on-disk state after a
++	// restart.
++	db.rangeDels.dropMarkersWithPrefix(filtered)
+ 	db.opt.Infof("DropPrefix done")
+ 	return nil
+ }
+diff --git a/iterator.go b/iterator.go
+index f57cfa4..b364d92 100644
+--- a/iterator.go
++++ b/iterator.go
+@@ -637,6 +637,17 @@ func (it *Iterator) parseItem() bool {
+ 		return false
+ 	}
+ 
++	// Skip keys shadowed by a range tombstone (DeleteRange). This applies in
++	// AllVersions mode as well: unlike a point delete, there is no per-key
++	// tombstone the user could observe in the key's own slot, so surfacing a
++	// range-deleted version would leak deleted data in every mode. The
++	// tombstones themselves remain observable through InternalAccess iterators
++	// under their internal !badger!rdel! keys.
++	if !isInternalKey && it.txn.isRangeDeleted(y.ParseKey(key), version) {
++		mi.Next()
++		return false
++	}
++
+ 	if it.opt.AllVersions {
+ 		// Return deleted or expired values also, otherwise user can't figure out
+ 		// whether the key was deleted.
+diff --git a/levels.go b/levels.go
+index de4cfc0..63ffb9a 100644
+--- a/levels.go
++++ b/levels.go
+@@ -816,6 +816,19 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
+ 
+ 			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
+ 
++			// Range tombstones (DeleteRange) shadow every version of every key in
++			// their interval, independently of which table/level holds them, so
++			// consult the DB-wide index here. Drop shadowed entries from the output
++			// and credit their value-log bytes so vlog GC can reclaim the space
++			// later. Internal entries (the tombstones themselves, txn markers) are
++			// never shadowed.
++			if uk := y.ParseKey(it.Key()); !bytes.HasPrefix(uk, badgerPrefix) &&
++				s.kv.rangeDels.covered(uk, version, math.MaxUint64) {
++				numSkips++
++				updateStats(vs)
++				continue
++			}
++
+ 			// Do not discard entries inserted by merge operator. These entries will be
+ 			// discarded once they're merged
+ 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
+@@ -1290,6 +1303,12 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
+ 	}
+ 	cd.thisRange = getKeyRange(out...)
+ 	cd.top = out
++	// Range tombstone markers carried by these L0 tables shadow keys across
++	// intervals of user keys that are far away from the marker's own internal
++	// key. Widen thisRange by the marker intervals so the affected tables at
++	// the base level are picked into the merge and their shadowed entries are
++	// dropped here (the subcompaction range filter itself is index-based).
++	s.kv.rangeDels.expandKeyRangeForMarkers(&cd.thisRange, out)
+ 
+ 	left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
+ 	cd.bot = make([]*table.Table, right-left)
+@@ -1450,6 +1469,11 @@ func (s *levelsController) fillTables(cd *compactDef) bool {
+ 	for _, t := range tables {
+ 		cd.thisSize = t.Size()
+ 		cd.thisRange = getKeyRange(t)
++		// If this table carries range tombstone markers, the intervals they
++		// shadow can reach far beyond the table's own key range; widen the
++		// compaction range so the tables at the next level that hold the
++		// shadowed data are pulled into the merge.
++		s.kv.rangeDels.expandKeyRangeForMarkers(&cd.thisRange, []*table.Table{t})
+ 		// If we're already compacting this range, don't do anything.
+ 		if s.cstatus.overlapsWith(cd.thisLevel.level, cd.thisRange) {
+ 			continue
+diff --git a/structs.go b/structs.go
+index ce0d238..d0e4e59 100644
+--- a/structs.go
++++ b/structs.go
+@@ -138,6 +138,12 @@ type Entry struct {
+ 	// Fields maintained internally.
+ 	hlen         int // Length of the header.
+ 	valThreshold int64
++
++	// opSeq records the order of operations within the transaction that
++	// created the entry (see modifyEntry). It is used to decide whether a
++	// range deletion issued in the same transaction shadows an earlier write
++	// of the same key. Entries created outside a transaction default to 0.
++	opSeq int
+ }
+ 
+ func (e *Entry) isZero() bool {
+diff --git a/txn.go b/txn.go
+index 9c916d1..7622689 100644
+--- a/txn.go
++++ b/txn.go
+@@ -250,6 +250,14 @@ type Txn struct {
+ 
+ 	pendingWrites   map[string]*Entry // cache stores any writes done by txn.
+ 	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries.
++	// pendingRangeDels tracks range deletions made by this (not yet committed)
++	// transaction, so its own reads and iterators see them even though they are
++	// not in the DB-wide range tombstone index until commit.
++	pendingRangeDels []pendingRangeDel
++	// opSeq numbers the transaction's write operations in order, so that the
++	// relative order of point writes and range deletions (which share a
++	// commit timestamp) can be resolved.
++	opSeq int
+ 
+ 	numIterators atomic.Int32
+ 	discarded    bool
+@@ -349,6 +357,13 @@ func exceedsSize(prefix string, max int64, key []byte) error {
+ }
+ 
+ func (txn *Txn) modify(e *Entry) error {
++	return txn.modifyEntry(e, false)
++}
++
++// modifyEntry is modify with an extra internal flag: when true, entries with
++// the reserved !badger! prefix are accepted. It is only used for range
++// tombstones (DeleteRange), which must store their marker under that prefix.
++func (txn *Txn) modifyEntry(e *Entry, allowInternalKey bool) error {
+ 	const maxKeySize = 65000
+ 
+ 	switch {
+@@ -358,7 +373,7 @@ func (txn *Txn) modify(e *Entry) error {
+ 		return ErrDiscardedTxn
+ 	case len(e.Key) == 0:
+ 		return ErrEmptyKey
+-	case bytes.HasPrefix(e.Key, badgerPrefix):
++	case !allowInternalKey && bytes.HasPrefix(e.Key, badgerPrefix):
+ 		return ErrInvalidKey
+ 	case len(e.Key) > maxKeySize:
+ 		// Key length can't be more than uint16, as determined by table::header.  To
+@@ -385,6 +400,11 @@ func (txn *Txn) modify(e *Entry) error {
+ 		fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
+ 		txn.conflictKeys[fp] = struct{}{}
+ 	}
++	// Number this operation within the transaction. The sequence is what lets
++	// us resolve the order of point writes and range deletions, which
++	// otherwise commit with the same timestamp.
++	txn.opSeq++
++	e.opSeq = txn.opSeq
+ 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
+ 	// Add the entry to duplicateWrites only if both the entries have different versions. For
+ 	// same versions, we will overwrite the existing entry.
+@@ -429,6 +449,101 @@ func (txn *Txn) Delete(key []byte) error {
+ 	return txn.modify(e)
+ }
+ 
++// DeleteRange deletes all keys in the half-open range [startKey, endKey),
++// i.e. every key k such that startKey <= k < endKey. Unlike DropPrefix, it
++// neither blocks writes nor scans/rewrites the stored data: it records a
++// single range tombstone in the LSM tree and returns as soon as the
++// transaction commits. Reads and iterations that start after the commit no
++// longer see the keys in the range, while the space they occupy is reclaimed
++// gradually by background compactions and value-log GC, just like point
++// deletes.
++//
++// A nil or empty startKey means the range starts at the beginning of the
++// keyspace; a nil or empty endKey means the range extends to the end. The
++// bounds must not use the reserved !badger! prefix. If both bounds are given,
++// startKey must be strictly smaller than endKey.
++//
++// As with point deletes, only versions older than or equal to the range
++// tombstone's commit timestamp are hidden: a key written again after the
++// deletion (with a newer version) is visible. Reads running in transactions
++// started before the commit are unaffected, preserving snapshot isolation.
++//
++// The current transaction keeps references to the startKey/endKey slices;
++// users must not modify them until the end of the transaction.
++func (txn *Txn) DeleteRange(startKey, endKey []byte) error {
++	if err := validateRangeBound("startKey", startKey); err != nil {
++		return err
++	}
++	if err := validateRangeBound("endKey", endKey); err != nil {
++		return err
++	}
++	if len(startKey) > 0 && len(endKey) > 0 && bytes.Compare(startKey, endKey) >= 0 {
++		return ErrInvalidRequest
++	}
++	if err := txn.db.isBanned(startKey); err != nil {
++		return err
++	}
++
++	e := &Entry{
++		Key:   rangeDelKey(startKey),
++		Value: endKey,
++		meta:  bitRangeDelete,
++	}
++	if err := txn.modifyEntry(e, true); err != nil {
++		return err
++	}
++	txn.pendingRangeDels = append(txn.pendingRangeDels, pendingRangeDel{
++		start: startKey,
++		end:   endKey,
++		seq:   e.opSeq,
++	})
++	return nil
++}
++
++// ownRangeDeleteAfter reports whether the transaction issued a DeleteRange
++// covering key with an operation sequence later than seq. Passing seq 0 means
++// the key has no own write, so any pending range deletion counts.
++func (txn *Txn) ownRangeDeleteAfter(seq int, key []byte) bool {
++	for i := range txn.pendingRangeDels {
++		d := &txn.pendingRangeDels[i]
++		if d.seq > seq && rangeCovers(d.start, d.end, key) {
++			return true
++		}
++	}
++	return false
++}
++
++// droppedByPendingRangeDelete reports whether an uncommitted entry must be
++// dropped at commit because a DeleteRange issued later in the same
++// transaction covers it. Such an entry shares the tombstone's commit
++// timestamp (unversioned entries commit as one transaction), so the strict
++// timestamp comparison used for committed entries would keep it visible.
++// Explicitly versioned entries (managed mode) are left to the index
++// comparison after commit.
++func (txn *Txn) droppedByPendingRangeDelete(e *Entry) bool {
++	if e.meta&bitRangeDelete > 0 || e.version != 0 || bytes.HasPrefix(e.Key, badgerPrefix) {
++		return false
++	}
++	return txn.ownRangeDeleteAfter(e.opSeq, e.Key)
++}
++
++// isRangeDeleted reports whether key at the given version must be hidden by a
++// range deletion: one pending in this transaction or a committed range
++// tombstone visible at the transaction's readTs.
++func (txn *Txn) isRangeDeleted(key []byte, version uint64) bool {
++	if txn.update {
++		// An own Set/Delete for this exact key wins, unless a range deletion
++		// was issued later in the same transaction.
++		if e, ok := txn.pendingWrites[string(key)]; ok && bytes.Equal(key, e.Key) {
++			return txn.ownRangeDeleteAfter(e.opSeq, key)
++		}
++		if txn.ownRangeDeleteAfter(0, key) {
++			return true
++		}
++	}
++	return txn.db.rangeDels.covered(key, version, txn.readTs)
++}
++
+ // Get looks for key and returns corresponding Item.
+ // If key is not found, ErrKeyNotFound is returned.
+ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
+@@ -445,6 +560,12 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
+ 	item = new(Item)
+ 	if txn.update {
+ 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
++			// A range deletion issued later in the same transaction
++			// overrides this write, even though both commit with the same
++			// timestamp.
++			if txn.ownRangeDeleteAfter(e.opSeq, key) {
++				return nil, ErrKeyNotFound
++			}
+ 			if isDeletedOrExpired(e.meta, e.ExpiresAt) {
+ 				return nil, ErrKeyNotFound
+ 			}
+@@ -462,6 +583,13 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
+ 		// Only track reads if this is update txn. No need to track read if txn serviced it
+ 		// internally.
+ 		txn.addReadKey(key)
++
++		// A range deletion performed in this transaction commits together
++		// with it, so its own reads must see it (own exact writes, including
++		// those issued after the DeleteRange, are handled above).
++		if txn.ownRangeDeleteAfter(0, key) {
++			return nil, ErrKeyNotFound
++		}
+ 	}
+ 
+ 	seek := y.KeyWithTs(key, txn.readTs)
+@@ -532,6 +660,20 @@ func (txn *Txn) commitAndSend() (func() error, error) {
+ 		return nil, ErrConflict
+ 	}
+ 
++	// Drop point writes that a later DeleteRange in the same transaction
++	// covers: they would commit with the tombstone's timestamp and the
++	// strict timestamp comparison could not tell the later delete apart
++	// from them. The tombstone entry itself (and explicitly versioned
++	// managed-mode entries, which the timestamp comparison handles after
++	// commit) is kept.
++	pending := make([]*Entry, 0, len(txn.pendingWrites))
++	for _, e := range txn.pendingWrites {
++		if txn.droppedByPendingRangeDelete(e) {
++			continue
++		}
++		pending = append(pending, e)
++	}
++
+ 	keepTogether := true
+ 	setVersion := func(e *Entry) {
+ 		if e.version == 0 {
+@@ -540,7 +682,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
+ 			keepTogether = false
+ 		}
+ 	}
+-	for _, e := range txn.pendingWrites {
++	for _, e := range pending {
+ 		setVersion(e)
+ 	}
+ 	// The duplicateWrites slice will be non-empty only if there are duplicate
+@@ -572,7 +714,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
+ 	// var b strings.Builder
+ 	// fmt.Fprintf(&b, "Read: %d. Commit: %d. reads: %v. writes: %v. Keys: ",
+ 	// 	txn.readTs, commitTs, txn.reads, txn.conflictKeys)
+-	for _, e := range txn.pendingWrites {
++	for _, e := range pending {
+ 		processEntry(e)
+ 	}
+ 	for _, e := range txn.duplicateWrites {
+diff --git a/value.go b/value.go
+index e042651..6a570c5 100644
+--- a/value.go
++++ b/value.go
+@@ -40,6 +40,12 @@ const (
+ 	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
+ 	// Set if item shouldn't be discarded via compactions (used by merge operator)
+ 	bitMergeEntry byte = 1 << 3
++	// bitRangeDelete marks an internal entry (stored under the !badger!rdel!
++	// prefix) as a range tombstone produced by DeleteRange. Such entries are
++	// always kept inline in the LSM tree (they are never written to the value
++	// log) and shadow every key version at or below their own timestamp inside
++	// their key interval.
++	bitRangeDelete byte = 1 << 4
+ 	// The MSB 2 bits are for transactions.
+ 	bitTxn    byte = 1 << 6 // Set if the entry is part of a txn.
+ 	bitFinTxn byte = 1 << 7 // Set if the entry is to indicate end of txn in value log.
+@@ -886,7 +892,11 @@ func (vlog *valueLog) write(reqs []*request) error {
+ 
+ 			e := b.Entries[j]
+ 			valueSizes = append(valueSizes, int64(len(e.Value)))
+-			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
++			// Range tombstones are always stored inline in the LSM tree,
++			// regardless of their size or the value threshold: they must not
++			// create value log garbage that the GC path does not know how to
++			// rewrite.
++			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) || e.meta&bitRangeDelete > 0 {
+ 				b.Ptrs = append(b.Ptrs, valuePointer{})
+ 				continue
+ 			}

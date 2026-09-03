@@ -1,0 +1,4 @@
+PASS
+ok  	verifier.example/badger-range-delete-t01	3.037s
+
+EXIT_CODE=0

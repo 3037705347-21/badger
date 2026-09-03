@@ -250,6 +250,14 @@ type Txn struct {
 
 	pendingWrites   map[string]*Entry // cache stores any writes done by txn.
 	duplicateWrites []*Entry          // Used in managed mode to store duplicate entries.
+	// pendingRangeDels tracks range deletions made by this (not yet committed)
+	// transaction, so its own reads and iterators see them even though they are
+	// not in the DB-wide range tombstone index until commit.
+	pendingRangeDels []pendingRangeDel
+	// opSeq numbers the transaction's write operations in order, so that the
+	// relative order of point writes and range deletions (which share a
+	// commit timestamp) can be resolved.
+	opSeq int
 
 	numIterators atomic.Int32
 	discarded    bool
@@ -349,6 +357,13 @@ func exceedsSize(prefix string, max int64, key []byte) error {
 }
 
 func (txn *Txn) modify(e *Entry) error {
+	return txn.modifyEntry(e, false)
+}
+
+// modifyEntry is modify with an extra internal flag: when true, entries with
+// the reserved !badger! prefix are accepted. It is only used for range
+// tombstones (DeleteRange), which must store their marker under that prefix.
+func (txn *Txn) modifyEntry(e *Entry, allowInternalKey bool) error {
 	const maxKeySize = 65000
 
 	switch {
@@ -358,7 +373,7 @@ func (txn *Txn) modify(e *Entry) error {
 		return ErrDiscardedTxn
 	case len(e.Key) == 0:
 		return ErrEmptyKey
-	case bytes.HasPrefix(e.Key, badgerPrefix):
+	case !allowInternalKey && bytes.HasPrefix(e.Key, badgerPrefix):
 		return ErrInvalidKey
 	case len(e.Key) > maxKeySize:
 		// Key length can't be more than uint16, as determined by table::header.  To
@@ -385,6 +400,11 @@ func (txn *Txn) modify(e *Entry) error {
 		fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
 		txn.conflictKeys[fp] = struct{}{}
 	}
+	// Number this operation within the transaction. The sequence is what lets
+	// us resolve the order of point writes and range deletions, which
+	// otherwise commit with the same timestamp.
+	txn.opSeq++
+	e.opSeq = txn.opSeq
 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
 	// Add the entry to duplicateWrites only if both the entries have different versions. For
 	// same versions, we will overwrite the existing entry.
@@ -429,6 +449,101 @@ func (txn *Txn) Delete(key []byte) error {
 	return txn.modify(e)
 }
 
+// DeleteRange deletes all keys in the half-open range [startKey, endKey),
+// i.e. every key k such that startKey <= k < endKey. Unlike DropPrefix, it
+// neither blocks writes nor scans/rewrites the stored data: it records a
+// single range tombstone in the LSM tree and returns as soon as the
+// transaction commits. Reads and iterations that start after the commit no
+// longer see the keys in the range, while the space they occupy is reclaimed
+// gradually by background compactions and value-log GC, just like point
+// deletes.
+//
+// A nil or empty startKey means the range starts at the beginning of the
+// keyspace; a nil or empty endKey means the range extends to the end. The
+// bounds must not use the reserved !badger! prefix. If both bounds are given,
+// startKey must be strictly smaller than endKey.
+//
+// As with point deletes, only versions older than or equal to the range
+// tombstone's commit timestamp are hidden: a key written again after the
+// deletion (with a newer version) is visible. Reads running in transactions
+// started before the commit are unaffected, preserving snapshot isolation.
+//
+// The current transaction keeps references to the startKey/endKey slices;
+// users must not modify them until the end of the transaction.
+func (txn *Txn) DeleteRange(startKey, endKey []byte) error {
+	if err := validateRangeBound("startKey", startKey); err != nil {
+		return err
+	}
+	if err := validateRangeBound("endKey", endKey); err != nil {
+		return err
+	}
+	if len(startKey) > 0 && len(endKey) > 0 && bytes.Compare(startKey, endKey) >= 0 {
+		return ErrInvalidRequest
+	}
+	if err := txn.db.isBanned(startKey); err != nil {
+		return err
+	}
+
+	e := &Entry{
+		Key:   rangeDelKey(startKey),
+		Value: endKey,
+		meta:  bitRangeDelete,
+	}
+	if err := txn.modifyEntry(e, true); err != nil {
+		return err
+	}
+	txn.pendingRangeDels = append(txn.pendingRangeDels, pendingRangeDel{
+		start: startKey,
+		end:   endKey,
+		seq:   e.opSeq,
+	})
+	return nil
+}
+
+// ownRangeDeleteAfter reports whether the transaction issued a DeleteRange
+// covering key with an operation sequence later than seq. Passing seq 0 means
+// the key has no own write, so any pending range deletion counts.
+func (txn *Txn) ownRangeDeleteAfter(seq int, key []byte) bool {
+	for i := range txn.pendingRangeDels {
+		d := &txn.pendingRangeDels[i]
+		if d.seq > seq && rangeCovers(d.start, d.end, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// droppedByPendingRangeDelete reports whether an uncommitted entry must be
+// dropped at commit because a DeleteRange issued later in the same
+// transaction covers it. Such an entry shares the tombstone's commit
+// timestamp (unversioned entries commit as one transaction), so the strict
+// timestamp comparison used for committed entries would keep it visible.
+// Explicitly versioned entries (managed mode) are left to the index
+// comparison after commit.
+func (txn *Txn) droppedByPendingRangeDelete(e *Entry) bool {
+	if e.meta&bitRangeDelete > 0 || e.version != 0 || bytes.HasPrefix(e.Key, badgerPrefix) {
+		return false
+	}
+	return txn.ownRangeDeleteAfter(e.opSeq, e.Key)
+}
+
+// isRangeDeleted reports whether key at the given version must be hidden by a
+// range deletion: one pending in this transaction or a committed range
+// tombstone visible at the transaction's readTs.
+func (txn *Txn) isRangeDeleted(key []byte, version uint64) bool {
+	if txn.update {
+		// An own Set/Delete for this exact key wins, unless a range deletion
+		// was issued later in the same transaction.
+		if e, ok := txn.pendingWrites[string(key)]; ok && bytes.Equal(key, e.Key) {
+			return txn.ownRangeDeleteAfter(e.opSeq, key)
+		}
+		if txn.ownRangeDeleteAfter(0, key) {
+			return true
+		}
+	}
+	return txn.db.rangeDels.covered(key, version, txn.readTs)
+}
+
 // Get looks for key and returns corresponding Item.
 // If key is not found, ErrKeyNotFound is returned.
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
@@ -445,6 +560,12 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	item = new(Item)
 	if txn.update {
 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
+			// A range deletion issued later in the same transaction
+			// overrides this write, even though both commit with the same
+			// timestamp.
+			if txn.ownRangeDeleteAfter(e.opSeq, key) {
+				return nil, ErrKeyNotFound
+			}
 			if isDeletedOrExpired(e.meta, e.ExpiresAt) {
 				return nil, ErrKeyNotFound
 			}
@@ -462,6 +583,13 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 		// Only track reads if this is update txn. No need to track read if txn serviced it
 		// internally.
 		txn.addReadKey(key)
+
+		// A range deletion performed in this transaction commits together
+		// with it, so its own reads must see it (own exact writes, including
+		// those issued after the DeleteRange, are handled above).
+		if txn.ownRangeDeleteAfter(0, key) {
+			return nil, ErrKeyNotFound
+		}
 	}
 
 	seek := y.KeyWithTs(key, txn.readTs)
@@ -532,6 +660,20 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		return nil, ErrConflict
 	}
 
+	// Drop point writes that a later DeleteRange in the same transaction
+	// covers: they would commit with the tombstone's timestamp and the
+	// strict timestamp comparison could not tell the later delete apart
+	// from them. The tombstone entry itself (and explicitly versioned
+	// managed-mode entries, which the timestamp comparison handles after
+	// commit) is kept.
+	pending := make([]*Entry, 0, len(txn.pendingWrites))
+	for _, e := range txn.pendingWrites {
+		if txn.droppedByPendingRangeDelete(e) {
+			continue
+		}
+		pending = append(pending, e)
+	}
+
 	keepTogether := true
 	setVersion := func(e *Entry) {
 		if e.version == 0 {
@@ -540,7 +682,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 			keepTogether = false
 		}
 	}
-	for _, e := range txn.pendingWrites {
+	for _, e := range pending {
 		setVersion(e)
 	}
 	// The duplicateWrites slice will be non-empty only if there are duplicate
@@ -572,7 +714,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	// var b strings.Builder
 	// fmt.Fprintf(&b, "Read: %d. Commit: %d. reads: %v. writes: %v. Keys: ",
 	// 	txn.readTs, commitTs, txn.reads, txn.conflictKeys)
-	for _, e := range txn.pendingWrites {
+	for _, e := range pending {
 		processEntry(e)
 	}
 	for _, e := range txn.duplicateWrites {

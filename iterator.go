@@ -637,6 +637,17 @@ func (it *Iterator) parseItem() bool {
 		return false
 	}
 
+	// Skip keys shadowed by a range tombstone (DeleteRange). This applies in
+	// AllVersions mode as well: unlike a point delete, there is no per-key
+	// tombstone the user could observe in the key's own slot, so surfacing a
+	// range-deleted version would leak deleted data in every mode. The
+	// tombstones themselves remain observable through InternalAccess iterators
+	// under their internal !badger!rdel! keys.
+	if !isInternalKey && it.txn.isRangeDeleted(y.ParseKey(key), version) {
+		mi.Next()
+		return false
+	}
+
 	if it.opt.AllVersions {
 		// Return deleted or expired values also, otherwise user can't figure out
 		// whether the key was deleted.

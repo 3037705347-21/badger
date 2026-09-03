@@ -816,6 +816,19 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 
 			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
 
+			// Range tombstones (DeleteRange) shadow every version of every key in
+			// their interval, independently of which table/level holds them, so
+			// consult the DB-wide index here. Drop shadowed entries from the output
+			// and credit their value-log bytes so vlog GC can reclaim the space
+			// later. Internal entries (the tombstones themselves, txn markers) are
+			// never shadowed.
+			if uk := y.ParseKey(it.Key()); !bytes.HasPrefix(uk, badgerPrefix) &&
+				s.kv.rangeDels.covered(uk, version, math.MaxUint64) {
+				numSkips++
+				updateStats(vs)
+				continue
+			}
+
 			// Do not discard entries inserted by merge operator. These entries will be
 			// discarded once they're merged
 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
@@ -1290,6 +1303,12 @@ func (s *levelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	}
 	cd.thisRange = getKeyRange(out...)
 	cd.top = out
+	// Range tombstone markers carried by these L0 tables shadow keys across
+	// intervals of user keys that are far away from the marker's own internal
+	// key. Widen thisRange by the marker intervals so the affected tables at
+	// the base level are picked into the merge and their shadowed entries are
+	// dropped here (the subcompaction range filter itself is index-based).
+	s.kv.rangeDels.expandKeyRangeForMarkers(&cd.thisRange, out)
 
 	left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
 	cd.bot = make([]*table.Table, right-left)
@@ -1450,6 +1469,11 @@ func (s *levelsController) fillTables(cd *compactDef) bool {
 	for _, t := range tables {
 		cd.thisSize = t.Size()
 		cd.thisRange = getKeyRange(t)
+		// If this table carries range tombstone markers, the intervals they
+		// shadow can reach far beyond the table's own key range; widen the
+		// compaction range so the tables at the next level that hold the
+		// shadowed data are pulled into the merge.
+		s.kv.rangeDels.expandKeyRangeForMarkers(&cd.thisRange, []*table.Table{t})
 		// If we're already compacting this range, don't do anything.
 		if s.cstatus.overlapsWith(cd.thisLevel.level, cd.thisRange) {
 			continue

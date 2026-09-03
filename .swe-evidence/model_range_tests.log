@@ -1,0 +1,26 @@
+=== RUN   TestDeleteRangeBasic
+--- PASS: TestDeleteRangeBasic (0.03s)
+=== RUN   TestDeleteRangeOpenBounds
+--- PASS: TestDeleteRangeOpenBounds (0.02s)
+=== RUN   TestDeleteRangeEverything
+--- PASS: TestDeleteRangeEverything (0.02s)
+=== RUN   TestDeleteRangeSameTransaction
+--- PASS: TestDeleteRangeSameTransaction (0.03s)
+=== RUN   TestDeleteRangeSnapshotIsolation
+--- PASS: TestDeleteRangeSnapshotIsolation (0.04s)
+=== RUN   TestDeleteRangeRewriteAfterDelete
+--- PASS: TestDeleteRangeRewriteAfterDelete (0.03s)
+=== RUN   TestDeleteRangeValidation
+--- PASS: TestDeleteRangeValidation (0.02s)
+=== RUN   TestDeleteRangeWriteBatch
+--- PASS: TestDeleteRangeWriteBatch (0.03s)
+=== RUN   TestDeleteRangePrefixIterator
+--- PASS: TestDeleteRangePrefixIterator (0.02s)
+=== RUN   TestDeleteRangeReopen
+--- PASS: TestDeleteRangeReopen (0.03s)
+=== RUN   TestDeleteRangeCompaction
+--- PASS: TestDeleteRangeCompaction (0.09s)
+=== RUN   TestDeleteRangeInteractsWithDeleteAndDropPrefix
+--- PASS: TestDeleteRangeInteractsWithDeleteAndDropPrefix (0.02s)
+PASS
+ok  	github.com/dgraph-io/badger/v4	0.980s

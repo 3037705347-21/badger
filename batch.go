@@ -170,6 +170,28 @@ func (wb *WriteBatch) DeleteAt(k []byte, ts uint64) error {
 	return wb.SetEntry(&e)
 }
 
+// DeleteRange is equivalent of Txn.DeleteRange. See Txn.DeleteRange for the
+// semantics of startKey/endKey.
+func (wb *WriteBatch) DeleteRange(startKey, endKey []byte) error {
+	wb.Lock()
+	defer wb.Unlock()
+
+	if err := wb.txn.DeleteRange(startKey, endKey); err != ErrTxnTooBig {
+		return err
+	}
+	// Txn has reached it's zenith. Commit now.
+	if cerr := wb.commit(); cerr != nil {
+		return cerr
+	}
+	// This time the error must not be ErrTxnTooBig, otherwise, we make the
+	// error permanent.
+	if err := wb.txn.DeleteRange(startKey, endKey); err != nil {
+		wb.err.Store(err)
+		return err
+	}
+	return nil
+}
+
 // Delete is equivalent of Txn.Delete.
 func (wb *WriteBatch) Delete(k []byte) error {
 	wb.Lock()

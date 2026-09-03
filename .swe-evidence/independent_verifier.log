@@ -1,0 +1,16 @@
+=== RUN   TestExternalRangeVisibilityAndBoundaries
+--- PASS: TestExternalRangeVisibilityAndBoundaries (0.01s)
+=== RUN   TestExternalDeleteRangeReturnsPromptlyAndDoesNotBlockWriter
+--- PASS: TestExternalDeleteRangeReturnsPromptlyAndDoesNotBlockWriter (0.15s)
+=== RUN   TestExternalTransactionSnapshotAndExistingDeletionCompatibility
+--- PASS: TestExternalTransactionSnapshotAndExistingDeletionCompatibility (0.05s)
+=== RUN   TestExternalPersistenceCompactionAndGC
+--- PASS: TestExternalPersistenceCompactionAndGC (0.76s)
+=== RUN   TestExternalEmptyAndInvalidRanges
+--- PASS: TestExternalEmptyAndInvalidRanges (0.04s)
+=== RUN   TestExternalConcurrentRangeAndPointWrites
+--- PASS: TestExternalConcurrentRangeAndPointWrites (0.12s)
+PASS
+ok  	verifier.example/badger-range-delete-t01	1.583s
+
+EXIT_CODE=0

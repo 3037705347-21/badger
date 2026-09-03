@@ -1,0 +1,21 @@
+ok  	github.com/dgraph-io/badger/v4	275.441s
+?   	github.com/dgraph-io/badger/v4/badger	[no test files]
+ok  	github.com/dgraph-io/badger/v4/badger/cmd	(cached)
+?   	github.com/dgraph-io/badger/v4/fb	[no test files]
+?   	github.com/dgraph-io/badger/v4/integration/lsmbench	[no test files]
+?   	github.com/dgraph-io/badger/v4/integration/testgc	[no test files]
+?   	github.com/dgraph-io/badger/v4/options	[no test files]
+--- FAIL: TestProtosRegenerate (1.11s)
+    protos_test.go:26: 
+        	Error Trace:	/Users/zhangchengcheng/work/ai-project/Trea/swe/badger-range-delete-T01/pb/protos_test.go:26
+        	Error:      	Received unexpected error:
+        	            	exit status 1
+        	Test:       	TestProtosRegenerate
+        	Messages:   	Got error while regenerating protos: exit status 1
+FAIL
+FAIL	github.com/dgraph-io/badger/v4/pb	1.821s
+ok  	github.com/dgraph-io/badger/v4/skl	(cached)
+ok  	github.com/dgraph-io/badger/v4/table	(cached)
+ok  	github.com/dgraph-io/badger/v4/trie	(cached)
+ok  	github.com/dgraph-io/badger/v4/y	(cached)
+FAIL

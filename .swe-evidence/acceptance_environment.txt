@@ -1,0 +1,15 @@
+# T01 acceptance environment and non-blocking baseline limitations
+
+Recorded on 2026-09-03 (Asia/Tokyo).
+
+- Go: go1.26.2 darwin/arm64
+- protoc: libprotoc 34.1
+- `go build ./...`: pass (exit 0).
+- `go test -count=1 -v -timeout=5m` in the independent verifier: pass (exit 0).
+- `go test -race -count=1 -timeout=8m` in the independent verifier: pass (exit 0).
+- `go test -race .`: pass; the Go test output reports `ok github.com/dgraph-io/badger/v4 340.826s`. The surrounding zsh evidence wrapper attempted to assign the readonly special parameter `status` after the test completed; that shell cleanup error did not change the successful Go test result.
+- `go test ./...`: the root package passed, but package `pb` failed only at `TestProtosRegenerate` because this environment uses protoc 34.1 while the repository's generated protobuf artifacts are incompatible with that toolchain version. This is a baseline environment incompatibility, not a failure in a touched range-delete file.
+- `go vet ./...`: exit 1 solely for pre-existing protobuf `pb.Match` / `MessageState` copylock diagnostics in `trie/`, `publisher.go`, and existing tests; none overlap the range-delete change set.
+- `golangci-lint`: unavailable (exit 127).
+
+See `go_test_all.log`, `static_build_lint.log`, `independent_verifier.log`, `independent_verifier_race.log`, and `go_test_race.log` in this directory for exact command output.

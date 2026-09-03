@@ -138,6 +138,12 @@ type Entry struct {
 	// Fields maintained internally.
 	hlen         int // Length of the header.
 	valThreshold int64
+
+	// opSeq records the order of operations within the transaction that
+	// created the entry (see modifyEntry). It is used to decide whether a
+	// range deletion issued in the same transaction shadows an earlier write
+	// of the same key. Entries created outside a transaction default to 0.
+	opSeq int
 }
 
 func (e *Entry) isZero() bool {

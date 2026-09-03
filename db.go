@@ -129,6 +129,11 @@ type DB struct {
 	bannedNamespaces *lockedKeys
 	threshold        *vlogThreshold
 
+	// rangeDels is the in-memory index of range tombstones (DeleteRange). It
+	// is rebuilt from the LSM tree at Open and appended to on every range
+	// delete; see rangedel.go for details.
+	rangeDels *rangeDelIndex
+
 	pub        *publisher
 	registry   *KeyRegistry
 	blockCache *ristretto.Cache[[]byte, *table.Block]
@@ -261,6 +266,7 @@ func Open(opt Options) (*DB, error) {
 		allocPool:        z.NewAllocatorPool(8),
 		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
 		threshold:        initVlogThreshold(&opt),
+		rangeDels:        newRangeDelIndex(),
 	}
 
 	db.flushCond = sync.NewCond(&db.lock)
@@ -392,6 +398,12 @@ func Open(opt Options) (*DB, error) {
 
 	if err := db.initBannedNamespaces(); err != nil {
 		return db, fmt.Errorf("While setting banned keys: %w", err)
+	}
+
+	// Rebuild the in-memory range tombstone index from the range delete
+	// entries persisted in memtables and tables.
+	if err := db.loadRangeTombstones(); err != nil {
+		return db, y.Wrapf(err, "while loading range tombstones")
 	}
 
 	db.closers.writes = z.NewCloser(1)
@@ -795,6 +807,14 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
 
 	var maxVs y.ValueStruct
 	version := y.ParseTs(key)
+	// Range tombstones live under the internal !badger! prefix and must never
+	// be themselves shadowed by a range delete (e.g. DeleteRange(nil, nil)).
+	userKey := y.ParseKey(key)
+	canRangeDelete := !bytes.HasPrefix(userKey, badgerPrefix)
+	shadowed := func(vs y.ValueStruct) bool {
+		return canRangeDelete && (vs.Meta != 0 || vs.Value != nil) &&
+			db.rangeDels.covered(userKey, vs.Version, version)
+	}
 
 	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
 	for i := 0; i < len(tables); i++ {
@@ -806,13 +826,23 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
 		// Found the required version of the key, return immediately.
 		if vs.Version == version {
 			y.NumGetsWithResultsAdd(db.opt.MetricsEnabled, 1)
+			if shadowed(vs) {
+				return y.ValueStruct{}, nil
+			}
 			return vs, nil
 		}
 		if maxVs.Version < vs.Version {
 			maxVs = vs
 		}
 	}
-	return db.lc.get(key, maxVs, 0)
+	vs, err := db.lc.get(key, maxVs, 0)
+	if err != nil {
+		return y.ValueStruct{}, err
+	}
+	if shadowed(vs) {
+		return y.ValueStruct{}, nil
+	}
+	return vs, nil
 }
 
 var requestPool = sync.Pool{
@@ -831,6 +861,13 @@ func (db *DB) writeToLSM(b *request) error {
 
 	for i, entry := range b.Entries {
 		var err error
+		if entry.meta&bitRangeDelete > 0 {
+			// Register the range tombstone in the in-memory index before it
+			// becomes reachable, so reads and compactions can filter the keys
+			// it shadows. It is rebuilt from the LSM tree on Open, so this
+			// registration only needs to cover new writes.
+			db.registerRangeDelete(entry)
+		}
 		if entry.skipVlogAndSetThreshold(db.valueThreshold()) {
 			// Will include deletion / tombstone case.
 			err = db.mt.Put(entry.Key,
@@ -1843,6 +1880,9 @@ func (db *DB) dropAll() (func(), error) {
 	db.blockCache.Clear()
 	db.indexCache.Clear()
 	db.threshold.Clear(db.opt)
+	// All range tombstones were stored in the tables and value logs that were
+	// just discarded, so the in-memory index must be reset as well.
+	db.rangeDels.clear()
 	return resume, nil
 }
 
@@ -1906,6 +1946,11 @@ func (db *DB) DropPrefix(prefixes ...[]byte) error {
 	if err := db.lc.dropPrefixes(filtered); err != nil {
 		return err
 	}
+	// dropPrefixes physically removed any range tombstone markers whose
+	// internal key carried one of the dropped prefixes; drop them from the
+	// in-memory index as well, so the index matches the on-disk state after a
+	// restart.
+	db.rangeDels.dropMarkersWithPrefix(filtered)
 	db.opt.Infof("DropPrefix done")
 	return nil
 }

@@ -40,6 +40,12 @@ const (
 	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
 	// Set if item shouldn't be discarded via compactions (used by merge operator)
 	bitMergeEntry byte = 1 << 3
+	// bitRangeDelete marks an internal entry (stored under the !badger!rdel!
+	// prefix) as a range tombstone produced by DeleteRange. Such entries are
+	// always kept inline in the LSM tree (they are never written to the value
+	// log) and shadow every key version at or below their own timestamp inside
+	// their key interval.
+	bitRangeDelete byte = 1 << 4
 	// The MSB 2 bits are for transactions.
 	bitTxn    byte = 1 << 6 // Set if the entry is part of a txn.
 	bitFinTxn byte = 1 << 7 // Set if the entry is to indicate end of txn in value log.
@@ -886,7 +892,11 @@ func (vlog *valueLog) write(reqs []*request) error {
 
 			e := b.Entries[j]
 			valueSizes = append(valueSizes, int64(len(e.Value)))
-			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
+			// Range tombstones are always stored inline in the LSM tree,
+			// regardless of their size or the value threshold: they must not
+			// create value log garbage that the GC path does not know how to
+			// rewrite.
+			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) || e.meta&bitRangeDelete > 0 {
 				b.Ptrs = append(b.Ptrs, valuePointer{})
 				continue
 			}
