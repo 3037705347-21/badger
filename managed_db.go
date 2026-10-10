@@ -70,6 +70,13 @@ func (txn *Txn) CommitAt(commitTs uint64, callback func(error)) error {
 // SetDiscardTs sets a timestamp at or below which, any invalid or deleted
 // versions can be discarded from the LSM tree, and thence from the value log to
 // reclaim disk space. Can only be used with managed transactions.
+//
+// SetDiscardTs is ephemeral: the timestamp is not persisted and resets to zero
+// on restart, and feeding a smaller timestamp than previously set is not
+// allowed. When the watermark is maintained outside Badger, prefer
+// ReconcileDiscardTs instead, which durably records the applied watermark,
+// restores it across restarts, rejects rollbacks and unreadable inputs, and can
+// force physical reclamation.
 func (db *DB) SetDiscardTs(ts uint64) {
 	if !db.opt.managedTxns {
 		panic("Cannot use SetDiscardTs with managedDB=false.")

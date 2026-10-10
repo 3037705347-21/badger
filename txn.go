@@ -115,6 +115,19 @@ func (o *oracle) setDiscardTs(ts uint64) {
 	o.cleanupCommittedTransactions()
 }
 
+// restoreDiscardTs re-establishes a durably recorded discard watermark during
+// Open. Unlike setDiscardTs it does not run committed-transaction cleanup: at
+// Open time the value log has not yet replayed, so touching lastCleanupTs
+// could trip its monotonicity assertion when replayed commits carry older
+// timestamps. It only ever raises the value.
+func (o *oracle) restoreDiscardTs(ts uint64) {
+	o.Lock()
+	defer o.Unlock()
+	if ts > o.discardTs {
+		o.discardTs = ts
+	}
+}
+
 func (o *oracle) discardAtOrBelow() uint64 {
 	if o.isManaged {
 		o.Lock()

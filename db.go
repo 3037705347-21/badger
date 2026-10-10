@@ -125,6 +125,10 @@ type DB struct {
 	gcActive    atomic.Bool
 	gcDiscardTs atomic.Uint64
 
+	// discardWMMu serializes ReconcileDiscardTs calls; their reclamation phase
+	// runs a maintenance window that stops the background compactors.
+	discardWMMu sync.Mutex
+
 	orc              *oracle
 	bannedNamespaces *lockedKeys
 	threshold        *vlogThreshold
@@ -265,6 +269,22 @@ func Open(opt Options) (*DB, error) {
 
 	db.flushCond = sync.NewCond(&db.lock)
 	db.syncChan = opt.syncChan
+
+	// In managed mode, restore the durably recorded discard watermark before
+	// any compaction can run, so post-restart compactions keep reclaiming
+	// versions at or below it. If the record is unreadable, stay conservative
+	// (discardTs = 0 discards nothing) and leave the error to be surfaced by
+	// ReconcileDiscardTs, which refuses to advance until the record is fixed.
+	if !opt.InMemory && opt.managedTxns {
+		if ts, exists, lerr := loadPersistedDiscardTs(opt.Dir); lerr != nil {
+			opt.Errorf("Discard watermark record unreadable: %v. Keeping discardTs at 0; "+
+				"repair or remove %s before calling ReconcileDiscardTs.\n",
+				lerr, filepath.Join(opt.Dir, discardWatermarkFname))
+		} else if exists {
+			db.orc.restoreDiscardTs(ts)
+			opt.Infof("Restored managed discard watermark to %d\n", ts)
+		}
+	}
 
 	// Cleanup all the goroutines started by badger in case of an error.
 	defer func() {

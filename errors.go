@@ -114,4 +114,15 @@ var (
 
 	// ErrDBClosed is returned when a get operation is performed after closing the DB.
 	ErrDBClosed = stderrors.New("DB Closed")
+
+	// ErrDiscardTsRegressed is returned by DB.ReconcileDiscardTs when the
+	// authoritative discard watermark is older (smaller) than the one already
+	// applied and durably recorded by this DB. Acting on a regressed watermark
+	// is unsafe, so reconciliation makes no changes when this is returned.
+	ErrDiscardTsRegressed = stderrors.New("Discard watermark regressed")
+
+	// ErrInvalidDiscardWatermark is returned when the durable discard-watermark
+	// record cannot be read (wrong size, bad magic, or checksum mismatch).
+	// Reconciliation makes no changes until the record is repaired or removed.
+	ErrInvalidDiscardWatermark = stderrors.New("Invalid discard watermark record")
 )
