@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -234,29 +235,47 @@ Structure of Key Registry.
 +-------------------+---------------------+--------------------+--------------+------------------+
 */
 
-// WriteKeyRegistry will rewrite the existing key registry file with new one.
-// It is okay to give closed key registry. Since, it's using only the datakey.
-func WriteKeyRegistry(reg *KeyRegistry, opt KeyRegistryOptions) error {
+// marshalKeyRegistry serializes a key registry into the byte layout written on disk.
+// Data keys are emitted in ascending key-id order so the output is deterministic and
+// can be checksummed for reconciliation. It is okay to pass a closed key registry,
+// since only its data keys are used.
+func marshalKeyRegistry(reg *KeyRegistry, encryptionKey []byte) ([]byte, error) {
 	buf := &bytes.Buffer{}
 	iv, err := y.GenerateIV()
 	y.Check(err)
-	// Encrypt sanity text if the encryption key is presents.
+	// Encrypt sanity text if the encryption key is present.
 	eSanity := sanityText
-	if len(opt.EncryptionKey) > 0 {
+	if len(encryptionKey) > 0 {
 		var err error
-		eSanity, err = y.XORBlockAllocate(eSanity, opt.EncryptionKey, iv)
+		eSanity, err = y.XORBlockAllocate(eSanity, encryptionKey, iv)
 		if err != nil {
-			return y.Wrapf(err, "Error while encrypting sanity text in WriteKeyRegistry")
+			return nil, y.Wrapf(err, "Error while encrypting sanity text in marshalKeyRegistry")
 		}
 	}
 	y.Check2(buf.Write(iv))
 	y.Check2(buf.Write(eSanity))
+	// Emit data keys in a deterministic order.
+	ids := make([]uint64, 0, len(reg.dataKeys))
+	for id := range reg.dataKeys {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	// Write all the datakeys to the buf.
-	for _, k := range reg.dataKeys {
+	for _, id := range ids {
 		// Writing the datakey to the given buffer.
-		if err := storeDataKey(buf, opt.EncryptionKey, k); err != nil {
-			return y.Wrapf(err, "Error while storing datakey in WriteKeyRegistry")
+		if err := storeDataKey(buf, encryptionKey, reg.dataKeys[id]); err != nil {
+			return nil, y.Wrapf(err, "Error while storing datakey in marshalKeyRegistry")
 		}
+	}
+	return buf.Bytes(), nil
+}
+
+// WriteKeyRegistry will rewrite the existing key registry file with new one.
+// It is okay to give closed key registry. Since, it's using only the datakey.
+func WriteKeyRegistry(reg *KeyRegistry, opt KeyRegistryOptions) error {
+	data, err := marshalKeyRegistry(reg, opt.EncryptionKey)
+	if err != nil {
+		return err
 	}
 	tmpPath := filepath.Join(opt.Dir, KeyRegistryRewriteFileName)
 	// Open temporary file to write the data and do atomic rename.
@@ -264,8 +283,8 @@ func WriteKeyRegistry(reg *KeyRegistry, opt KeyRegistryOptions) error {
 	if err != nil {
 		return y.Wrapf(err, "Error while opening tmp file in WriteKeyRegistry")
 	}
-	// Write buf to the disk.
-	if _, err = fp.Write(buf.Bytes()); err != nil {
+	// Write data to the disk.
+	if _, err = fp.Write(data); err != nil {
 		// close the fd before returning error. We're not using defer
 		// because, for windows we need to close the fd explicitly before
 		// renaming.
