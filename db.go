@@ -125,6 +125,9 @@ type DB struct {
 	gcActive    atomic.Bool
 	gcDiscardTs atomic.Uint64
 
+	// purgeLock serializes ledger-driven PurgePrefixes runs on this DB.
+	purgeLock sync.Mutex
+
 	orc              *oracle
 	bannedNamespaces *lockedKeys
 	threshold        *vlogThreshold
