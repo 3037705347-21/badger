@@ -373,7 +373,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	}
 
 	if deleteFileNow {
-		if err := vlog.deleteLogFile(f); err != nil {
+		if err := vlog.deleteLogFile(f, delByGC); err != nil {
 			return err
 		}
 	}
@@ -404,23 +404,35 @@ func (vlog *valueLog) decrIteratorCount() error {
 	vlog.filesLock.Unlock()
 
 	for _, lf := range lfs {
-		if err := vlog.deleteLogFile(lf); err != nil {
+		if err := vlog.deleteLogFile(lf, delByGC); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (vlog *valueLog) deleteLogFile(lf *logFile) error {
+func (vlog *valueLog) deleteLogFile(lf *logFile, reason uint8) error {
 	if lf == nil {
 		return nil
 	}
 	lf.lock.Lock()
 	defer lf.lock.Unlock()
 	// Delete fid from discard stats as well.
-	vlog.discardStats.Update(lf.fid, -1)
+	if vlog.discardStats != nil {
+		vlog.discardStats.Update(lf.fid, -1)
+	}
 
-	return lf.Delete()
+	if err := lf.Delete(); err != nil {
+		return err
+	}
+	// Record the terminal outcome only after the unlink succeeded, so an
+	// interrupted deletion re-runs to the same result on the next open.
+	if vlog.ledger != nil {
+		if err := vlog.ledger.markDeleted(lf.fid, reason); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (vlog *valueLog) dropAll() (int, error) {
@@ -435,7 +447,7 @@ func (vlog *valueLog) dropAll() (int, error) {
 		vlog.filesLock.Lock()
 		defer vlog.filesLock.Unlock()
 		for _, lf := range vlog.filesMap {
-			if err := vlog.deleteLogFile(lf); err != nil {
+			if err := vlog.deleteLogFile(lf, delDropAll); err != nil {
 				return err
 			}
 			count++
@@ -477,6 +489,10 @@ type valueLog struct {
 
 	garbageCh    chan struct{}
 	discardStats *discardStats
+
+	// ledger durably records which value-log files this DB owns and what
+	// happened to them during GC. Nil in InMemory mode.
+	ledger *gcLedger
 }
 
 func vlogFilePath(dirPath string, fid uint32) string {
@@ -487,6 +503,14 @@ func (vlog *valueLog) fpath(fid uint32) string {
 	return vlogFilePath(vlog.dirPath, fid)
 }
 
+// vlogCandidate is a *.vlog directory entry pending ownership classification.
+type vlogCandidate struct {
+	name    string
+	fid     uint32
+	size    int64
+	numeric bool
+}
+
 func (vlog *valueLog) populateFilesMap() error {
 	vlog.filesMap = make(map[uint32]*logFile)
 
@@ -495,36 +519,215 @@ func (vlog *valueLog) populateFilesMap() error {
 		return errFile(err, vlog.dirPath, "Unable to open log dir.")
 	}
 
-	found := make(map[uint64]struct{})
+	onDisk := make(map[string]int64)
+	candidates := make([]vlogCandidate, 0, len(files))
 	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".vlog") {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".vlog") {
 			continue
 		}
-		fsz := len(file.Name())
-		fid, err := strconv.ParseUint(file.Name()[:fsz-5], 10, 32)
-		if err != nil {
-			return errFile(err, file.Name(), "Unable to parse log id.")
+		name := file.Name()
+		info, ierr := file.Info()
+		if ierr != nil {
+			return errFile(ierr, name, "Unable to stat log file.")
 		}
-		if _, ok := found[fid]; ok {
-			return errFile(err, file.Name(), "Duplicate file found. Please delete one.")
-		}
-		found[fid] = struct{}{}
+		onDisk[name] = info.Size()
 
-		lf := &logFile{
-			fid:      uint32(fid),
-			path:     vlog.fpath(uint32(fid)),
+		fid, perr := strconv.ParseUint(name[:len(name)-len(".vlog")], 10, 32)
+		if perr != nil {
+			// A non-numeric *.vlog used to be a fatal open error. It is not a
+			// Badger file, so record it as foreign and leave it untouched.
+			candidates = append(candidates, vlogCandidate{name: name, size: info.Size()})
+			continue
+		}
+		candidates = append(candidates, vlogCandidate{
+			name:    name,
+			fid:     uint32(fid),
+			size:    info.Size(),
+			numeric: true,
+		})
+	}
+
+	// Fold the durable ledger and the actual directory contents onto each
+	// other before anything is opened, so the restart always converges.
+	if err := vlog.reconcileLedger(onDisk); err != nil {
+		return err
+	}
+
+	include := func(fid uint32) {
+		vlog.filesMap[fid] = &logFile{
+			fid:      fid,
+			path:     vlog.fpath(fid),
 			registry: vlog.db.registry,
 		}
-		vlog.filesMap[uint32(fid)] = lf
-		if vlog.maxFid < uint32(fid) {
-			vlog.maxFid = uint32(fid)
+		if vlog.maxFid < fid {
+			vlog.maxFid = fid
+		}
+	}
+
+	bootstrapped := vlog.ledger == nil || vlog.ledger.isBootstrapped()
+	for _, c := range candidates {
+		if !c.numeric {
+			if vlog.ledger != nil && !vlog.ledger.isForeign(c.name) {
+				vlog.opt.Warningf("Ignoring non-Badger file in value log dir: %s", c.name)
+				if err := vlog.ledger.markForeign(c.name, c.size, foreignBadName); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if vlog.ledger != nil && vlog.ledger.isForeign(c.name) {
+			vlog.opt.Warningf("Ignoring foreign value log file: %s", c.name)
+			continue
+		}
+
+		state, known := fsAlive, false
+		if vlog.ledger != nil {
+			state, known = vlog.ledger.state(c.fid)
+		}
+		switch {
+		case known && state == fsDeleted:
+			// reconcileLedger reclassifies a file sitting on a deleted fid as
+			// foreign; nothing managed may reach here. Defensive skip.
+			continue
+		case known:
+			include(c.fid)
+		default:
+			// The ledger has never seen this fid. Before the ledger has
+			// bootstrapped (first open in an existing directory), adopt files
+			// that prove to be valid Badger value logs. Afterwards, only the
+			// single empty next-fid file may be adopted (orphan of a crash
+			// between file creation and the create record); everything else is
+			// foreign and stays untouched.
+			valid, empty := vlog.probeVlogFile(c.fid)
+			adopt := false
+			origin := uint8(originLegacy)
+			switch {
+			case !bootstrapped && valid:
+				adopt = true
+			case bootstrapped && valid && empty && c.fid == vlog.ledger.nextFid():
+				adopt = true
+				origin = originOrphan
+			}
+			if !adopt {
+				vlog.opt.Warningf("Ignoring value log file not owned by this DB: %s", c.name)
+				if vlog.ledger != nil {
+					reason := foreignUnregistered
+					if !valid {
+						reason = foreignInvalidVlog
+					}
+					if err := vlog.ledger.markForeign(c.name, c.size, reason); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if vlog.ledger != nil {
+				if err := vlog.ledger.markAdopted(c.fid, origin); err != nil {
+					return err
+				}
+			}
+			vlog.opt.Infof("Adopted value log file: %s (origin=%d)", c.name, origin)
+			include(c.fid)
+		}
+	}
+
+	// From here on any new *.vlog the DB did not create is foreign. The
+	// runtime maxFid stays the highest fid physically present (open() looks
+	// up filesMap[maxFid]); fid allocation additionally consults the ledger's
+	// all-time high-water mark in createVlogFile, so a deleted fid is never
+	// reused even when no managed file remains on disk.
+	if vlog.ledger != nil {
+		if err := vlog.ledger.ensureBootstrap(); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// reconcileLedger converges durable state with the directory contents:
+//
+//   - a GC left in flight whose file is present is retriable (fold back to
+//     alive); whose file is gone is recorded as deleted;
+//   - an alive file that has vanished is recorded as deleted, so the ledger
+//     agrees with what is actually on disk;
+//   - a file that reappears at an already deleted fid is not ours anymore: it
+//     is recorded as foreign and left untouched.
+func (vlog *valueLog) reconcileLedger(onDisk map[string]int64) error {
+	if vlog.ledger == nil {
+		return nil
+	}
+	report := vlog.ledger.snapshot()
+	for _, e := range report.managed {
+		name := fmt.Sprintf("%06d.vlog", e.fid)
+		size, present := onDisk[name]
+
+		switch e.state {
+		case fsGCRunning:
+			if present {
+				// Interrupted between GCStart and the file removal. The
+				// rewrite is safely re-runnable, so the file is alive again.
+				vlog.ledger.resetInterrupted(e.fid)
+			} else {
+				if err := vlog.ledger.markDeleted(e.fid, delMissing); err != nil {
+					return err
+				}
+			}
+		case fsAlive:
+			if !present {
+				vlog.opt.Warningf("Managed value log %s is gone from disk; converging ledger.", name)
+				if err := vlog.ledger.markDeleted(e.fid, delMissing); err != nil {
+					return err
+				}
+			}
+		case fsDeleted:
+			if present {
+				vlog.opt.Warningf("File at deleted fid %d is present again; "+
+					"treating it as foreign and leaving it untouched.", e.fid)
+				if err := vlog.ledger.markForeign(name, size, foreignReappeared); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// probeVlogFile reports whether path for fid is a readable Badger value log.
+// It never mutates the file. empty means it contains the vlog header but no
+// entries, which identifies the orphan of a crash right around file creation.
+func (vlog *valueLog) probeVlogFile(fid uint32) (valid, empty bool) {
+	path := vlog.fpath(fid)
+	lf := &logFile{
+		fid:      fid,
+		path:     path,
+		registry: vlog.db.registry,
+		opt:      vlog.opt,
+	}
+	if err := lf.open(path, os.O_RDONLY, 2*vlog.opt.ValueLogFileSize); err != nil {
+		return false, false
+	}
+	defer func() {
+		if lf.MmapFile != nil {
+			_ = lf.MmapFile.Close(-1)
+		}
+	}()
+	if lf.size.Load() < vlogHeaderSize {
+		return false, false
+	}
+	end, err := lf.iterate(true, 0, func(Entry, valuePointer) error { return nil })
+	if err != nil {
+		return false, false
+	}
+	return true, end == vlogHeaderSize
+}
+
 func (vlog *valueLog) createVlogFile() (*logFile, error) {
 	fid := vlog.maxFid + 1
+	// Never allocate a fid the ledger has ever managed, even if no managed
+	// file is currently on disk (e.g. after DropAll followed by a restart).
+	if vlog.ledger != nil && vlog.ledger.allTimeMaxFid() >= fid {
+		fid = vlog.ledger.allTimeMaxFid() + 1
+	}
 	path := vlog.fpath(fid)
 	lf := &logFile{
 		fid:      fid,
@@ -536,6 +739,17 @@ func (vlog *valueLog) createVlogFile() (*logFile, error) {
 	err := lf.open(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 2*vlog.opt.ValueLogFileSize)
 	if err != z.NewFile && err != nil {
 		return nil, err
+	}
+
+	// Durably record ownership of the new file before it becomes reachable.
+	// If this fails, remove the just-created file so it can't be confused with
+	// a foreign file; a crashed create at this point is adopted as an orphan
+	// on the next open (empty file at the expected next fid).
+	if vlog.ledger != nil {
+		if lerr := vlog.ledger.markCreated(fid); lerr != nil {
+			_ = lf.Delete()
+			return nil, lerr
+		}
 	}
 
 	vlog.filesLock.Lock()
@@ -567,6 +781,14 @@ func (vlog *valueLog) init(db *DB) {
 		return
 	}
 	vlog.dirPath = vlog.opt.ValueDir
+
+	// Load the ledger even in read-only mode: a read-only open must still
+	// distinguish managed files from files dropped into the directory by
+	// somebody else. A read-only ledger never writes; if no ledger exists yet
+	// it falls back to an ephemeral in-memory view.
+	ledger, err := openVlogLedger(vlog.opt)
+	y.Check(err)
+	vlog.ledger = ledger
 
 	if vlog.opt.ReadOnly {
 		return
@@ -615,7 +837,7 @@ func (vlog *valueLog) open(db *DB) error {
 		// We shouldn't delete the maxFid file.
 		if lf.size.Load() == vlogHeaderSize && fid != vlog.maxFid && !vlog.opt.ReadOnly {
 			vlog.opt.Infof("Deleting empty file: %s", lf.path)
-			if err := lf.Delete(); err != nil {
+			if err := vlog.deleteLogFile(lf, delEmpty); err != nil {
 				return y.Wrapf(err, "while trying to delete empty file: %s", lf.path)
 			}
 			delete(vlog.filesMap, fid)
@@ -669,6 +891,11 @@ func (vlog *valueLog) Close() error {
 	if vlog.discardStats != nil {
 		vlog.db.captureDiscardStats()
 		if terr := vlog.discardStats.Close(-1); terr != nil && err == nil {
+			err = terr
+		}
+	}
+	if vlog.ledger != nil {
+		if terr := vlog.ledger.close(); terr != nil && err == nil {
 			err = terr
 		}
 	}
@@ -1045,6 +1272,13 @@ LOOP:
 		vlog.discardStats.Update(fid, -1)
 		goto LOOP
 	}
+	// Ledger gate: never collect a file that isn't a managed, alive file
+	// (e.g. one whose GC has already succeeded but whose unlink is deferred
+	// behind active iterators).
+	if vlog.ledger != nil && !vlog.ledger.eligibleForGC(fid) {
+		vlog.discardStats.Update(fid, -1)
+		goto LOOP
+	}
 	// We have a valid file.
 	fi, err := lf.Fd.Stat()
 	if err != nil {
@@ -1087,9 +1321,28 @@ func (vlog *valueLog) doRunGC(lf *logFile) error {
 	_, span := otel.Tracer("").Start(context.TODO(), "Badger.GC")
 	span.SetAttributes(attribute.String("GC rewrite for", lf.path))
 	defer span.End()
+
+	// Durably mark the attempt as in flight before touching anything. If the
+	// process dies here, the next open folds the interrupted attempt back to
+	// alive and the rewrite runs again: rewrite is idempotent (it only moves
+	// entries the LSM still points at) and converges to the same outcome.
+	if vlog.ledger != nil {
+		if err := vlog.ledger.gcBegin(lf.fid); err != nil {
+			return err
+		}
+	}
 	if err := vlog.rewrite(lf); err != nil {
+		// A failed attempt leaves the file alive and retriable; the error is
+		// kept on the ledger entry instead of being silently retried forever.
+		if vlog.ledger != nil {
+			_ = vlog.ledger.gcFailed(lf.fid, err)
+		}
 		return err
 	}
+	// The success outcome (and the deleted tombstone) is recorded by
+	// deleteLogFile after the file is actually unlinked. If the deletion is
+	// deferred behind active iterators, it lands when they finish; a crash in
+	// between folds back to alive and re-runs safely.
 	// Remove the file from discardStats.
 	vlog.discardStats.Update(lf.fid, -1)
 	return nil
