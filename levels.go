@@ -1524,6 +1524,31 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	}()
 	changeSet := buildChangeSet(&cd, newTables)
 
+	// Flatten ledger hook (nil during ordinary compactions): durably record the
+	// batch intent BEFORE the main MANIFEST commits it. If this ledger write
+	// fails we return before touching MANIFEST at all; the deferred decr() below
+	// removes the freshly built output SSTs, while all input tables stay live --
+	// the batch rolls back to its last usable state.
+	var flattenBatchSeq uint64
+	if lg := s.kv.flattenLedger.Load(); lg != nil {
+		refs := make([]ledgerTableRef, 0, len(cd.top)+len(cd.bot))
+		for _, t := range cd.top {
+			refs = append(refs, ledgerTableRef{ID: t.ID(), Level: cd.thisLevel.level})
+		}
+		for _, t := range cd.bot {
+			refs = append(refs, ledgerTableRef{ID: t.ID(), Level: cd.nextLevel.level})
+		}
+		outIDs := make([]uint64, 0, len(newTables))
+		for _, t := range newTables {
+			outIDs = append(outIDs, t.ID())
+		}
+		seq, err := lg.prepareBatch(thisLevel.level, nextLevel.level, refs, outIDs)
+		if err != nil {
+			return y.Wrapf(err, "while persisting flatten ledger batch before commit")
+		}
+		flattenBatchSeq = seq
+	}
+
 	// We write to the manifest _before_ we delete files (and after we created files)
 	if err := s.kv.manifest.addChanges(changeSet.Changes, s.kv.opt); err != nil {
 		return err
@@ -1552,6 +1577,20 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	}
 	if err := thisLevel.deleteTables(cd.top); err != nil {
 		return err
+	}
+
+	// Flatten ledger hook: the batch is now durable in MANIFEST and live in the
+	// levels, record it as committed. If this fsync fails the MANIFEST commit can
+	// not be rolled back; we surface the error and stop flattening, and the next
+	// run reconciles this exact state (outputs live, inputs gone) by appending a
+	// repair commit record.
+	if flattenBatchSeq > 0 {
+		if lg := s.kv.flattenLedger.Load(); lg != nil {
+			if err := lg.commitBatch(flattenBatchSeq); err != nil {
+				return y.Wrapf(err, "while persisting flatten ledger commit for batch %d",
+					flattenBatchSeq)
+			}
+		}
 	}
 
 	// If this compaction removed tables from L0, the L0 table count has dropped, so
@@ -1661,10 +1700,20 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 		// point it could get used in some compaction.  This ensures the manifest file gets updated in
 		// the proper order. (That means this update happens before that of some compaction which
 		// deletes the table.)
-		err := s.kv.manifest.addChanges([]*pb.ManifestChange{
-			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
-		}, s.kv.opt)
-		if err != nil {
+		create := func() error {
+			return s.kv.manifest.addChanges([]*pb.ManifestChange{
+				newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
+			}, s.kv.opt)
+		}
+		// While a flatten job is running this id is >= the job's file-id fence and
+		// must be registered in the flatten ledger before it becomes visible in
+		// MANIFEST, so the completion gate cannot miss it. bornAround takes the
+		// ledger lock across both the ledger append and this MANIFEST create.
+		if lg := s.kv.flattenLedger.Load(); lg != nil {
+			if err := lg.bornAround(t.ID(), create); err != nil {
+				return err
+			}
+		} else if err := create(); err != nil {
 			return err
 		}
 	}

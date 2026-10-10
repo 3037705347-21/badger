@@ -190,6 +190,20 @@ func (mf *manifestFile) close() error {
 	return mf.fp.Close()
 }
 
+// tableSnapshot returns a point-in-time copy of the live table manifests (id ->
+// level/key/compression). Used by the flatten ledger to reconcile and to run its
+// completion gate; the copy is taken under the append lock that guards mf.
+// manifest.
+func (mf *manifestFile) tableSnapshot() map[uint64]TableManifest {
+	mf.appendLock.Lock()
+	defer mf.appendLock.Unlock()
+	out := make(map[uint64]TableManifest, len(mf.manifest.Tables))
+	for id, tm := range mf.manifest.Tables {
+		out[id] = tm
+	}
+	return out
+}
+
 // addChanges writes a batch of changes, atomically, to the file.  By "atomically" that means when
 // we replay the MANIFEST file, we'll either replay all the changes or none of them.  (The truth of
 // this depends on the filesystem -- some might append garbage data if a system crash happens at

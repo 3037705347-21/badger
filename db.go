@@ -112,6 +112,12 @@ type DB struct {
 	flushChan chan *memTable // For flushing memtables.
 	closeOnce sync.Once      // For closing DB only once.
 
+	// flattenLedger is non-nil only while DB.Flatten runs. Background compactors
+	// are stopped for the duration, so the only compactions that see a non-nil
+	// ledger are flatten-driven ones; the memtable flusher reads it to register
+	// tables born during the job.
+	flattenLedger atomic.Pointer[flattenLedger]
+
 	blockWrites atomic.Int32
 	isClosed    atomic.Uint32
 
@@ -1660,14 +1666,136 @@ func (db *DB) startMemoryFlush() {
 // levels, which is necessary after a restore from backup. During Flatten, live compactions are
 // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
 // between flattening the tree and new tables being created at level zero.
+//
+// On disk-backed DBs the run is guarded by a durable FLATTEN-LEDGER file that
+// records every moved table by its SST id (source level, destination level,
+// per-batch committed state). If Flatten is killed mid-run, re-invoking it
+// reconciles the ledger against MANIFEST and resumes: batches already committed
+// are not repeated, prepared-but-uncommitted batches are retried, and tables
+// flushed to level zero while the job ran are tracked via a file-id fence and
+// moved as well. A batch whose ledger record cannot be fsynced before the
+// MANIFEST commit aborts entirely with its input tables untouched.
 func (db *DB) Flatten(workers int) error {
 	if db.opt.ReadOnly {
 		panic("Cannot flatten in read-only mode.")
+	}
+	if workers < 1 {
+		workers = 1
 	}
 
 	db.stopCompactions()
 	defer db.startCompactions()
 
+	// In-memory DBs have no directory or MANIFEST; run the legacy loop without a
+	// durable ledger.
+	if db.opt.InMemory {
+		return db.runFlatten(workers, nil)
+	}
+
+	ledger, err := db.openOrResumeFlattenLedger()
+	if err != nil {
+		return err
+	}
+	db.flattenLedger.Store(ledger)
+	defer func() {
+		db.flattenLedger.Store(nil)
+		// No-op when runFlatten already closed and archived the ledger.
+		_ = ledger.close()
+	}()
+
+	return db.runFlatten(workers, ledger)
+}
+
+// openOrResumeFlattenLedger opens an existing unfinished flatten ledger and
+// reconciles it with the current MANIFEST, or starts a brand-new job. A
+// completed ledger left in place by a failed archive rename is moved aside
+// first.
+func (db *DB) openOrResumeFlattenLedger() (*flattenLedger, error) {
+	dir := db.opt.Dir
+
+	ledger, err := openFlattenLedger(dir)
+	if err != nil {
+		return nil, y.Wrap(err, "while opening flatten ledger")
+	}
+	// A crash between file creation and the JobStart frame leaves a header-only
+	// ledger with no job: nothing to resume, remove it and start over.
+	if ledger != nil && ledger.jobID == 0 {
+		if err := ledger.close(); err != nil {
+			return nil, err
+		}
+		if err := os.Remove(flattenLedgerPath(dir)); err != nil {
+			return nil, y.Wrap(err, "while removing empty flatten ledger")
+		}
+		if err := syncDir(dir); err != nil {
+			return nil, err
+		}
+		ledger = nil
+	}
+	if ledger != nil && ledger.complete {
+		jobID := ledger.jobID
+		if err := ledger.close(); err != nil {
+			return nil, err
+		}
+		if err := archiveFlattenLedger(dir, jobID); err != nil {
+			return nil, y.Wrap(err, "while archiving completed flatten ledger")
+		}
+		ledger = nil
+	}
+
+	if ledger != nil {
+		// Resume path: pair prepared batches with the post-crash MANIFEST truth.
+		if err := ledger.reconcile(db.manifest.tableSnapshot()); err != nil {
+			_ = ledger.close()
+			return nil, y.Wrap(err, "while reconciling flatten ledger")
+		}
+		st := ledger.status(db.manifest.tableSnapshot())
+		db.opt.Infof("Resuming flatten job %d from FLATTEN-LEDGER: %d/%d tables already at "+
+			"target level %d; continuing with the %d unfinished tables.\n",
+			ledger.jobID, st.Done, st.Total, st.TargetLevel, st.Pending)
+		return ledger, nil
+	}
+
+	target := db.flattenTargetLevel()
+	fence := db.lc.nextFileID.Load()
+	ledger, err = beginFlattenJob(dir, target, fence)
+	if err != nil {
+		return nil, y.Wrap(err, "while creating flatten ledger")
+	}
+	db.opt.Infof("Started flatten job %d. Target level: %d. File-id fence: %d.\n",
+		ledger.jobID, target, fence)
+	return ledger, nil
+}
+
+// flattenTargetLevel picks the consolidation sink: the deepest level that
+// currently holds tables, or the last level on an empty tree. Tables only ever
+// move to a deeper level, and L0->base compactions are clamped to the first
+// non-empty level, so every table (including one flushed during the run) ends at
+// this level once the tree is consolidated.
+func (db *DB) flattenTargetLevel() int {
+	target := db.lc.lastLevel().level
+	for i := len(db.lc.levels) - 1; i >= 0; i-- {
+		if db.lc.levels[i].numTables() > 0 {
+			target = i
+			break
+		}
+	}
+	return target
+}
+
+// flushesQuiescent reports that no immutable memtable is queued or being
+// flushed. The active (head) memtable may still receive writes; a table flushed
+// from it afterwards is born strictly after the completion decision, a normal
+// post-flatten table that a future run consolidates.
+func (db *DB) flushesQuiescent() bool {
+	db.lock.RLock()
+	nImm := len(db.imm)
+	db.lock.RUnlock()
+	return nImm == 0 && len(db.flushChan) == 0
+}
+
+// runFlatten drives the actual consolidation loop. ledger is nil for in-memory
+// DBs which keep the historical behaviour exactly.
+func (db *DB) runFlatten(workers int, ledger *flattenLedger) error {
 	compactAway := func(cp compactionPriority) error {
 		db.opt.Infof("Attempting to compact with %+v\n", cp)
 		errCh := make(chan error, 1)
@@ -1700,10 +1828,10 @@ func (db *DB) Flatten(workers int) error {
 		return humanize.IBytes(uint64(sz))
 	}
 
-	t := db.lc.levelTargets()
 	for {
 		db.opt.Infof("\n")
 		var levels []int
+		t := db.lc.levelTargets()
 		for i, l := range db.lc.levels {
 			sz := l.getTotalSize()
 			db.opt.Infof("Level: %d. %8s Size. %8s Max.\n",
@@ -1715,8 +1843,43 @@ func (db *DB) Flatten(workers int) error {
 		if len(levels) <= 1 {
 			prios := db.lc.pickCompactLevels(nil)
 			if len(prios) == 0 || prios[0].score <= 1.0 {
-				db.opt.Infof("All tables consolidated into one level. Flattening done.\n")
-				return nil
+				if ledger == nil {
+					db.opt.Infof("All tables consolidated into one level. Flattening done.\n")
+					return nil
+				}
+				finalLevel := -1
+				if len(levels) == 1 {
+					finalLevel = levels[0]
+				}
+				finished, ferr := ledger.tryFinish(
+					db.flushesQuiescent(), finalLevel, db.manifest.tableSnapshot)
+				if ferr != nil {
+					if finished {
+						// The JobComplete record is durable; only the archive rename
+						// failed. The next run moves it aside. Don't fail the whole
+						// flatten over an audit-file rename.
+						db.opt.Warningf("Flatten job %d completed but archiving the "+
+							"ledger failed: %v\n", ledger.jobID, ferr)
+						return nil
+					}
+					return ferr
+				}
+				if finished {
+					db.opt.Infof("All tables consolidated into one level. Flatten job %d done.\n",
+						ledger.jobID)
+					return nil
+				}
+				// The tree looks consolidated but the ledger gate is still open: a
+				// flush is in flight, a fence-born table is not registered yet, or a
+				// batch is unresolved. Wait briefly and re-evaluate instead of
+				// completing early -- a table must not be missed.
+				db.opt.Infof("Tree consolidated but flatten gate not open yet; " +
+					"waiting for in-flight flushes/commits.\n")
+				if db.IsClosed() {
+					return ErrDBClosed
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 			if err := compactAway(prios[0]); err != nil {
 				return err
@@ -1729,6 +1892,31 @@ func (db *DB) Flatten(workers int) error {
 			return err
 		}
 	}
+}
+
+// FlattenStatus reports the durable progress of a flatten run by combining the
+// FLATTEN-LEDGER with the current MANIFEST. It returns (nil, nil) when no
+// flatten ledger is present (in-memory DB, or no run ever started / the job was
+// already archived). It can be called while a flatten job is running.
+func (db *DB) FlattenStatus() (*FlattenStatus, error) {
+	if db.opt.InMemory || db.manifest == nil || db.manifest.inMemory {
+		return nil, nil
+	}
+	snapshot := db.manifest.tableSnapshot()
+
+	if ledger := db.flattenLedger.Load(); ledger != nil {
+		return ledger.status(snapshot), nil
+	}
+
+	ledger, err := readFlattenLedger(db.opt.Dir)
+	if err != nil {
+		return nil, y.Wrap(err, "while reading flatten ledger")
+	}
+	if ledger == nil {
+		return nil, nil
+	}
+	defer ledger.close()
+	return ledger.status(snapshot), nil
 }
 
 func (db *DB) blockWrite() error {
